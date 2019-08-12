@@ -1,3 +1,8 @@
+/*
+This script is only needed if you are running a version before 2016 and/or have not
+configured your tempdb files accordingly
+*/
+
 --Check the number of CPUs
 select cpu_count from sys.dm_os_sys_info
 
