@@ -47,7 +47,7 @@ RECONFIGURE WITH OVERRIDE
 GO
 
 --enable backup compression
-EXEC sp_configure 'backup compression', 1
+EXEC sp_configure 'backup compression default', 1
 RECONFIGURE WITH OVERRIDE
 GO
 
