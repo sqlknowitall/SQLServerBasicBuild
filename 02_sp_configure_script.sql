@@ -1,27 +1,53 @@
-sp_configure 'advanced options', 1
+/*
+PURPOSE: Set several sp_configure options to begin building the server
+
+USAGE:		Execute script as is
+----------------------------------------------------------------------------------------------
+REVISION HISTORY:
+Date				Developer Name				Change Description                                    
+----------			--------------				------------------
+07/18/2018			Jared Karney				Original Version
+08/12/2019			Jared Karney				Changed max and min memory to MS standards
+----------------------------------------------------------------------------------------------
+*/
+
+--enable advanced options 
+EXEC sp_configure 'advanced options', 1
 RECONFIGURE WITH OVERRIDE
 GO
-sp_configure 'xp_cmdshell',1
+
+--enable xp_cmdshell for build purposes. We will disable this later
+EXEC sp_configure 'xp_cmdshell',1
 reconfigure with override
 GO
-sp_configure 'database mail xps', 1
-RECONFIGURE WITH OVERRIDE
-GO
-sp_configure 'agent xps', 1
-RECONFIGURE WITH OVERRIDE
-GO
-sp_configure 'remote admin connections', 1
+
+--turn on database mail
+EXEC sp_configure 'database mail xps', 1
 RECONFIGURE WITH OVERRIDE
 GO
 
-sp_configure 'cost threshold for parallelism', 50;
+--turn on SQL Agent node
+EXEC sp_configure 'agent xps', 1
 RECONFIGURE WITH OVERRIDE
 GO
 
-sp_configure 'optimize for ad hoc workloads', 1
+--enable remote admin connections
+EXEC sp_configure 'remote admin connections', 1
 RECONFIGURE WITH OVERRIDE
 GO
 
+--set cost threshold for parallelism to something other than 5
+EXEC sp_configure 'cost threshold for parallelism', 50;
+RECONFIGURE WITH OVERRIDE
+GO
+
+--enable optimize for ad hoc workloads
+EXEC sp_configure 'optimize for ad hoc workloads', 1
+RECONFIGURE WITH OVERRIDE
+GO
+
+--begin setting max and min memory
+--change @execute to 0 if you only want recommendations
 SET NOCOUNT ON;
 
 -- declare local variables
@@ -32,48 +58,73 @@ DECLARE @InstanceMinMemory	INT
 DECLARE @InstanceMaxMemory	INT
 DECLARE @SQL				NVARCHAR(MAX)
 DECLARE @Execute			BIT
+DECLARE @MaxWorkerThreads	INT
+DECLARE @debug BIT
+
+--create temp table for sp_configure results
+CREATE TABLE #maxworkerthreads (name nvarchar(35), minimum int, maximum int, config_value int, run_value int)
+
+--Set this in MB to determine a setting for a specific amount of RAM, elst it will be the connected machine
+SET @ServerMemory = NULL
+
+--change to 1 to set the values for the server
+SET @Execute = 0
+
+--for debugging
+SET @debug = 0
 
 -- initialize local variables
 SELECT	@SQLVersionMajor	= @@MicrosoftVersion / 0x01000000, -- Get major version
-		@InstanceName		= @@SERVERNAME  + ' (' + CAST(SERVERPROPERTY('productversion') AS VARCHAR) + ' - ' +  LOWER(SUBSTRING(@@VERSION, CHARINDEX('X',@@VERSION),4))  + ' - ' + CAST(SERVERPROPERTY('edition') AS VARCHAR),
-		@Execute			= 1
+		@InstanceName		= @@SERVERNAME  + ' (' + CAST(SERVERPROPERTY('productversion') AS VARCHAR) + ' - ' +  LOWER(SUBSTRING(@@VERSION, CHARINDEX('X',@@VERSION),4))  + ' - ' + CAST(SERVERPROPERTY('edition') AS VARCHAR)
 
 -- get the server memory
 -- wrap queries execution with sp_executesql to avoid compilation errors
-IF @SQLVersionMajor >= 11
+IF @SQLVersionMajor >= 11 AND @ServerMemory IS NULL
 BEGIN
-	
 	SET @SQL = 'SELECT @ServerMemory = physical_memory_kb/1024 FROM	sys.dm_os_sys_info'
 	EXEC sp_executesql @SQL, N'@ServerMemory int OUTPUT', @ServerMemory = @ServerMemory OUTPUT
-
 END
-ELSE
-IF @SQLVersionMajor in (9, 10)
+ELSE IF @SQLVersionMajor < 11
 BEGIN
-	
-	SET @SQL = 'SELECT	@ServerMemory = physical_memory_in_bytes/1024/1024 FROM	sys.dm_os_sys_info'
-	EXEC sp_executesql @SQL, N'@ServerMemory int OUTPUT', @ServerMemory = @ServerMemory OUTPUT
-
-END
-ELSE
-BEGIN
-	
 	PRINT 'SQL Server versions before 2005 are not supported by this script.'
 	RETURN
-
 END
 
 -- fix rounding issues
 SET @ServerMemory = @ServerMemory + 1
 
--- now determine max server settings
--- utilized formula from Jonathan Kehayias: https://www.sqlskills.com/blogs/jonathan/how-much-memory-does-my-sql-server-actually-need/
--- reserve 1 GB of RAM for the OS, 1 GB for each 4 GB of RAM installed from 4–16 GB and then 1 GB for every 8 GB RAM installed above 16 GB RAM.
+-- Get max worker threads 
+INSERT INTO #maxworkerthreads
+EXEC sp_configure 'max worker threads'
 
-SELECT	@InstanceMaxMemory = 	CASE	WHEN @ServerMemory <= 1024*2 THEN @ServerMemory - 512  -- @ServerMemory < 2 GB
+IF(SELECT run_value FROM #maxworkerthreads WHERE name = 'max worker threads') <> 0
+BEGIN
+SELECT @MaxWorkerThreads = run_value
+FROM #maxworkerthreads
+WHERE name = 'max worker threads'
+END
+ELSE
+BEGIN
+SELECT @MaxWorkerThreads = 512 + ((cpu_count - 4) * 16) 
+FROM sys.dm_os_sys_info
+END
+DROP TABLE #maxworkerthreads
+
+--for debugging
+IF @debug = 1
+BEGIN
+PRINT '@serverMemory = ' + CAST(@serverMemory AS VARCHAR(25))
+PRINT '@maxworkerthreads = ' + CAST(@maxworkerthreads AS VARCHAR(25))
+END
+
+-- now determine max server settings
+-- used Microsoft's formula from https://docs.microsoft.com/en-us/sql/database-engine/configure-windows/server-memory-server-configuration-options?view=sql-server-2017
+-- reserve 1-4 GB of RAM for the OS, and then calculate required memory from thread stack needed (max num worker threads*2MB) + 256MB for reserved startup
+
+SELECT	@InstanceMaxMemory = 	CASE	WHEN @ServerMemory <= 1024*2 THEN @ServerMemory - 512  -- @ServerMemory <= 2 GB
 										WHEN @ServerMemory <= 1024*4 THEN @ServerMemory - 1024 -- @ServerMemory between 2 GB & 4 GB
-										WHEN @ServerMemory <= 1024*16 THEN @ServerMemory - 1024 - CEILING((@ServerMemory-4096) / (4.0*1024))*1024 -- @ServerMemory between 4 GB & 8 GB
-										WHEN @ServerMemory > 1024*16 THEN @ServerMemory - 4096 - CEILING((@ServerMemory-1024*16) / (8.0*1024))*1024 -- @ServerMemory > 8 GB
+										WHEN @ServerMemory <= 1024*8 THEN @ServerMemory - (2096+(@MaxWorkerThreads*2)+256) -- @ServerMemory between 4 GB & 8 GB
+										ELSE @ServerMemory - (4096+(@MaxWorkerThreads*2)+256) -- @ServerMemory > 8GB
 								END,
 		@InstanceMinMemory =	CEILING(@InstanceMaxMemory * .75) -- set minimum memory to 75% of the maximum
 
