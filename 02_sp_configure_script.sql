@@ -46,6 +46,12 @@ EXEC sp_configure 'optimize for ad hoc workloads', 1
 RECONFIGURE WITH OVERRIDE
 GO
 
+--enable backup compression
+EXEC sp_configure 'backup compression', 1
+RECONFIGURE WITH OVERRIDE
+GO
+
+
 --begin setting max and min memory
 --change @execute to 0 if you only want recommendations
 SET NOCOUNT ON;
